@@ -187,6 +187,24 @@ def zh_tidy(text: str) -> str:
     # 0) 標準化不可見空白
     text = re.sub(r"[ \t\u00A0]+", " ", text)
 
+    # 0.5) 清除數學公式 LaTeX 格式
+    # 清除 {\displaystyle ...} 格式（包括嵌套的大括號）
+    text = re.sub(r'\{\\displaystyle[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', '', text)
+    # 清除其他常見 LaTeX 格式
+    text = re.sub(r'\{\\[a-zA-Z]+[^}]*\}', '', text)
+    # 清除單獨的 {\displaystyle (沒有結束的情況)
+    text = re.sub(r'\{\\displaystyle.*?(?=\n|$)', '', text)
+    # 清除更複雜的 LaTeX 數學表達式
+    # 清除 \begin{...} ... \end{...} 結構
+    text = re.sub(r'\\begin\{[^}]+\}.*?\\end\{[^}]+\}', '', text, flags=re.DOTALL)
+    # 清除 LaTeX 命令
+    text = re.sub(r'\\[a-zA-Z]+\{[^}]*\}', '', text)
+    text = re.sub(r'\\[a-zA-Z]+', '', text)
+    # 清除殘留的大括號和數學符號
+    text = re.sub(r'\{[^{}]*\}', '', text)
+    # 清除連續的特殊字符
+    text = re.sub(r'[{}\\^_]+', '', text)
+
     # 1) 括號/書名號/引號 內側空白
     pairs = [
         ("《", "》"), ("〈", "〉"),
