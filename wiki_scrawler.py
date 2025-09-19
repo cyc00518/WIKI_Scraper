@@ -238,11 +238,88 @@ def smart_text(node: Tag) -> str:
     逐文字節點串接：
     - 只有「上一個字元」與「當前片段第一個字元」都為 ASCII 字母/數字時，才補 1 個空白
     - 其他情況直接相連，避免在 CJK 邊界製造多餘空白
+    - 特殊處理有序列表 (ol) 和無序列表 (ul)
     """
+    # 如果節點本身是列表，則特殊處理
+    if node.name == "ol":
+        return process_ordered_list(node)
+    elif node.name == "ul":
+        return process_unordered_list(node)
+    
+    # 先收集所有非列表內容
+    text_parts = []
+    last_ascii = False
+    
+    # 處理所有直接子節點
+    for child in node.children:
+        if isinstance(child, NavigableString):
+            s = str(child).strip()
+            if s:
+                cur_ascii = bool(s and s[0].isascii())
+                if text_parts and last_ascii and cur_ascii:
+                    text_parts.append(" ")
+                text_parts.append(s)
+                last_ascii = bool(s and s[-1].isascii())
+        elif isinstance(child, Tag):
+            if child.name in ["ol", "ul"]:
+                # 處理列表
+                if child.name == "ol":
+                    list_content = process_ordered_list(child)
+                else:
+                    list_content = process_unordered_list(child)
+                if list_content:
+                    text_parts.append(list_content)
+                    last_ascii = False
+            elif child.name == "br":
+                text_parts.append(" ")
+                last_ascii = False
+            else:
+                # 遞歸處理其他標籤
+                child_text = smart_text(child)
+                if child_text:
+                    cur_ascii = bool(child_text and child_text[0].isascii())
+                    if text_parts and last_ascii and cur_ascii:
+                        text_parts.append(" ")
+                    text_parts.append(child_text)
+                    last_ascii = bool(child_text and child_text[-1].isascii())
+    
+    return "".join(text_parts)
+
+
+def process_ordered_list(ol_tag: Tag) -> str:
+    """處理有序列表，添加序號"""
+    items = []
+    lis = ol_tag.find_all("li", recursive=False)
+    for i, li in enumerate(lis, 1):
+        if isinstance(li, Tag):
+            li_text = extract_text_from_li(li)
+            if li_text:
+                items.append(f"{i}. {li_text}")
+    return " ".join(items)
+
+
+def process_unordered_list(ul_tag: Tag) -> str:
+    """處理無序列表，添加項目符號"""
+    items = []
+    for li in ul_tag.find_all("li", recursive=False):
+        li_text = extract_text_from_li(li)
+        if li_text:
+            items.append(f"• {li_text}")
+    return " ".join(items)
+
+
+def extract_text_from_li(li_tag: Tag) -> str:
+    """從 li 標籤中提取文字，避免遞歸處理嵌套列表"""
     parts = []
     last_ascii = False
-    for d in node.descendants:
+    
+    for d in li_tag.descendants:
         if isinstance(d, NavigableString):
+            # 跳過嵌套列表中的文字
+            parent_li = d.find_parent("li")
+            if parent_li and parent_li != li_tag:
+                continue
+                
             s = str(d)
             if not s or not s.strip():
                 continue
@@ -253,8 +330,9 @@ def smart_text(node: Tag) -> str:
             parts.append(s)
             last_ascii = bool(s and s[-1].isascii())
         elif isinstance(d, Tag) and d.name == "br":
-            parts.append("\n")
+            parts.append(" ")
             last_ascii = False
+    
     return "".join(parts)
 
 
@@ -304,9 +382,19 @@ def table_to_lines(table: Tag, squeeze) -> list[str]:
 
         cells = tr.find_all(["th", "td"], recursive=False)
         for cell in cells:
-            text = table_squeeze(smart_text(cell))
-            colspan = _parse_int(cell.get("colspan"), 1)
-            rowspan = _parse_int(cell.get("rowspan"), 1)
+            # 調試：檢查是否有 ol 標籤
+            if isinstance(cell, Tag) and cell.find("ol"):
+                ol_tags = cell.find_all("ol")
+                for i, ol in enumerate(ol_tags):
+                    if isinstance(ol, Tag):
+                        processed_ol = process_ordered_list(ol)
+            
+            if isinstance(cell, Tag):
+                text = table_squeeze(smart_text(cell))
+                colspan = _parse_int(cell.get("colspan"), 1)
+                rowspan = _parse_int(cell.get("rowspan"), 1)
+            else:
+                continue
 
             # find the first slot that can host this cell (respecting existing rowspans)
             col_idx = 0
@@ -644,11 +732,23 @@ def html_to_text(html: str, exclude_sections: list[str] | None = None) -> str:
         "div.hatnote", "div.dablink", "div.rellink",
         # 清除 infobox 相關
         "table.infobox", "div.infobox", ".infobox",
-        # 清除模板和編輯相關
-        "div.navbox", "table.navbox", "div.mw-collapsible"
+        # 清除模板和編輯相關  
+        "div.navbox", "table.navbox",
+        # 清除側邊導航框
+        "table.sidebar", "div.sidebar", ".sidebar"
     ]:
         for tag in soup.select(sel):
             tag.decompose()
+    
+    # 特殊處理可摺疊內容 - 只移除導航用的摺疊區塊，保留內容用的摺疊區塊
+    for collapsible in soup.select("div.mw-collapsible"):
+        # 如果是 navbox 相關的摺疊內容，則移除
+        if collapsible.find_parent("div", class_="navbox") or "navbox" in " ".join(collapsible.get("class", [])):
+            collapsible.decompose()
+        # 如果是在表格內的摺疊內容（通常是專輯曲目），則展開而不移除
+        elif collapsible.find_parent("table"):
+            # 移除摺疊的樣式，讓內容完全展開
+            collapsible["class"] = [c for c in collapsible.get("class", []) if c not in ["mw-collapsed", "mw-collapsible"]]
 
     root = soup.select_one("div.mw-parser-output") or soup.body or soup
     elements = root.find_all(["h2", "h3", "p", "ul", "ol", "dl", "table"], recursive=True)
