@@ -16,6 +16,8 @@ import argparse
 import json
 import re
 import time
+import hashlib
+import os
 from pathlib import Path
 from typing import Iterable, Tuple, Optional
 from urllib.parse import urlparse, unquote, quote
@@ -32,31 +34,65 @@ DEFAULT_UA = "YourBotName/1.0 (contact@example.com)"  # 建議換成你的資訊
 # -------------------------------
 # 讀取目標清單
 # -------------------------------
-def iter_targets(path: Path) -> Iterable[Tuple[str, str]]:
+def iter_targets(path: Path) -> Iterable[Tuple[str, str, str]]:
     """
-    讀取 .txt 或 .jsonl 目標清單。
-    產出 (raw, kind)：kind = "url" 或 "title"
+    讀取 .txt 或 .jsonl 目標清單，或處理整個資料夾中的所有 .txt 檔案。
+    產出 (raw, kind, source_file)：kind = "url" 或 "title"，source_file 是來源檔案路徑
     """
-    if path.suffix.lower() == ".jsonl":
-        with path.open("r", encoding="utf-8") as f:
+    if path.is_dir():
+        # 如果是資料夾，掃描其中所有的 .txt 檔案
+        txt_files = list(path.glob("*.txt"))
+        jsonl_files = list(path.glob("*.jsonl"))
+        all_files = txt_files + jsonl_files
+        
+        if not all_files:
+            print(f"⚠️  資料夾 {path} 中沒有找到 .txt 或 .jsonl 檔案")
+            return
+        
+        print(f"📁 找到 {len(all_files)} 個檔案：{len(txt_files)} 個 .txt 檔案，{len(jsonl_files)} 個 .jsonl 檔案")
+        
+        for file_path in all_files:
+            print(f"📄 處理檔案：{file_path.name}")
+            yield from _process_single_file(file_path)
+    else:
+        # 如果是單一檔案
+        yield from _process_single_file(path)
+
+
+def _process_single_file(file_path: Path) -> Iterable[Tuple[str, str, str]]:
+    """
+    處理單一檔案，產出 (raw, kind, source_file)
+    """
+    source_file = str(file_path)
+    
+    if file_path.suffix.lower() == ".jsonl":
+        with file_path.open("r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
                     continue
-                obj = json.loads(line)
-                if "url" in obj and obj["url"]:
-                    yield obj["url"], "url"
-                elif "title" in obj and obj["title"]:
-                    yield obj["title"], "title"
+                try:
+                    obj = json.loads(line)
+                    if "url" in obj and obj["url"]:
+                        yield obj["url"], "url", source_file
+                    elif "title" in obj and obj["title"]:
+                        yield obj["title"], "title", source_file
+                except json.JSONDecodeError as e:
+                    print(f"⚠️  JSON 解析錯誤在 {file_path.name}: {e}")
+                    continue
     else:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
+        with file_path.open("r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
                 s = line.strip()
                 if not s or s.startswith("#"):
                     continue
-                if s.startswith("http://") or s.startswith("https://"):
-                    yield s, "url"
-                else:
-                    yield s, "title"
+                try:
+                    if s.startswith("http://") or s.startswith("https://"):
+                        yield s, "url", source_file
+                    else:
+                        yield s, "title", source_file
+                except Exception as e:
+                    print(f"⚠️  處理行 {line_num} 時出錯在 {file_path.name}: {e}")
+                    continue
 
 
 # -------------------------------
@@ -728,16 +764,409 @@ def ensure_labels_after_marker(text: str, *, title: str, session: requests.Sessi
     return _MISSING_AFTER_LABEL.sub(_repl, text)
 
 
-def html_to_text(html: str, exclude_sections: list[str] | None = None) -> str:
+def extract_specific_caption_from_tmulti(img, description_text, tmulti_container):
+    """
+    從 tmulti 容器的總體描述中提取特定圖片的說明
+    """
+    try:
+        # 檢查苗栗市的格式："上：...中：...下：..."
+        if "上：" in description_text and "中：" in description_text and "下：" in description_text:
+            # 解析上中下格式
+            sections = {}
+            
+            # 提取上部分
+            if "上：" in description_text:
+                start = description_text.find("上：") + 2
+                end = description_text.find("中：")
+                if end != -1:
+                    sections["上"] = description_text[start:end].strip()
+            
+            # 提取中部分
+            if "中：" in description_text:
+                start = description_text.find("中：") + 2
+                end = description_text.find("下：")
+                if end != -1:
+                    sections["中"] = description_text[start:end].strip()
+            
+            # 提取下部分
+            if "下：" in description_text:
+                start = description_text.find("下：") + 2
+                sections["下"] = description_text[start:].strip()
+            
+            # 根據圖片位置返回對應說明
+            img_position = get_image_position_in_tmulti(img, tmulti_container)
+            print(f"苗栗市圖片位置: {img_position}")
+            
+            if img_position == 0 and "上" in sections:
+                return sections["上"]
+            elif img_position in [1, 2] and "中" in sections:
+                # 中間部分可能有多個項目，分割處理
+                middle_text = sections["中"]
+                middle_items = [item.strip() for item in middle_text.split("、")]
+                if len(middle_items) > 1:
+                    if img_position == 1:
+                        return middle_items[0]  # 苗栗巨蛋
+                    elif img_position == 2:
+                        return middle_items[1]  # 苗栗市天后宮
+                return middle_text
+            elif img_position is not None and img_position >= 3 and "下" in sections:
+                # 下面部分可能有多個項目
+                bottom_text = sections["下"]
+                bottom_items = [item.strip() for item in bottom_text.split("、")]
+                bottom_position = img_position - 3
+                if bottom_position < len(bottom_items):
+                    return bottom_items[bottom_position]
+                return bottom_text
+        
+        # 檢查高雄市的格式："由左至右、從上至下：..."
+        elif "由左至右" in description_text and "：" in description_text:
+            # 解析 "由左至右、從上至下：高雄市區夜景、鳳山縣舊城鳳儀門、玉山主峰、衛武營國家藝術文化中心..."
+            parts = description_text.split("：", 1)
+            if len(parts) == 2:
+                items = [item.strip() for item in parts[1].split("、")]
+                
+                # 嘗試確定圖片在容器中的位置
+                img_position = get_image_position_in_tmulti(img, tmulti_container)
+                if img_position is not None and 0 <= img_position < len(items):
+                    return items[img_position]
+        
+        # 檢查是否包含特定關鍵詞，如衛武營
+        img_src = str(img.get("src", "")).lower()
+        if "wei-wu-ying" in img_src and "衛武營" in description_text:
+            return "衛武營國家藝術文化中心"
+        elif "kaohsiung_skyline" in img_src and ("夜景" in description_text or "市區" in description_text):
+            return "高雄市區夜景"
+        elif "鳳山" in description_text and ("鳳儀門" in description_text or "舊城" in description_text):
+            return "鳳山縣舊城鳳儀門"
+        elif "玉山" in description_text and "主峰" in description_text:
+            return "玉山主峰"
+        elif "龍虎塔" in description_text:
+            return "龍虎塔"
+        elif "光之穹頂" in description_text:
+            return "光之穹頂"
+        elif "體育場" in description_text or "stadium" in img_src.lower():
+            return "國家體育場"
+        
+        # 苗栗市特定關鍵詞匹配
+        elif "miaoli_station" in img_src or "tra_miaoli" in img_src:
+            return "臺鐵苗栗車站"
+        elif "miaoli_arena" in img_src:
+            return "苗栗巨蛋"
+        elif "tianhou" in img_src or "天后宮" in description_text:
+            return "苗栗市天后宮"
+        elif "wenchang" in img_src or "文昌祠" in description_text:
+            return "苗栗文昌祠"
+        elif "miaoli" in img_src and ("街景" in description_text or "panoramio" in img_src):
+            return "苗栗街景"
+        
+    except Exception as e:
+        print(f"解析 tmulti caption 時出錯: {e}")
+    
+    return ""
+
+def get_image_position_in_tmulti(img, tmulti_container):
+    """
+    獲取圖片在 tmulti 容器中的位置（從0開始）
+    """
+    try:
+        # 找到所有的 tsingle 元素
+        tsingle_elements = tmulti_container.find_all("div", class_="tsingle")
+        
+        # 找到包含該圖片的 tsingle
+        img_tsingle = img.find_parent("div", class_="tsingle")
+        if img_tsingle and img_tsingle in tsingle_elements:
+            return tsingle_elements.index(img_tsingle)
+    except Exception:
+        pass
+    
+    return None
+
+def download_image(url: str, output_dir: Path, session: requests.Session) -> Optional[str]:
+    """
+    下載圖片並返回本地文件名
+    """
+    try:
+        # 生成唯一的文件名
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+        
+        # 從URL獲取文件擴展名
+        parsed_url = urlparse(url)
+        path = parsed_url.path.lower()
+        if path.endswith(('.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg')):
+            ext = path.split('.')[-1]
+        else:
+            ext = 'jpg'  # 默認為jpg
+        
+        filename = f"{url_hash}.{ext}"
+        filepath = output_dir / filename
+        
+        # 檢查文件是否已存在
+        if filepath.exists():
+            return filename
+        
+        # 下載圖片
+        response = session.get(url, timeout=30)
+        response.raise_for_status()
+        
+        # 確保目錄存在
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 保存文件
+        with open(filepath, 'wb') as f:
+            f.write(response.content)
+        
+        print(f"✅ 下載圖片: {filename}")
+        return filename
+        
+    except Exception as e:
+        print(f"❌ 圖片下載失敗 {url}: {e}")
+        return None
+
+
+def extract_images_from_infoboxes(soup: BeautifulSoup, title: str, source_url: str, 
+                                 images_dir: Path, session: requests.Session) -> Tuple[list[str], list[dict]]:
+    """
+    從資訊框（infobox）中提取主要圖片資訊，下載圖片並返回圖片資訊
+    返回: (文本中的圖片描述列表, JSONL格式的圖片資訊列表)
+    """
+    image_info_text = []
+    image_info_json = []
+    
+    # 查找資訊框中的主要圖片（通常是人物照片等）
+    infoboxes = soup.select("table.infobox")
+    
+    for infobox in infoboxes:
+        # 查找資訊框中的圖片區域 - 擴展支援更多類別
+        image_selectors = [
+            "td.infobox-image",        # 標準人物照片
+            ".infobox-image",          # 一般 infobox 圖片
+            ".ib-settlement-cols-cell", # 城市/地區的圖片（如市徽）
+            "td.maptable",             # 地圖表格
+            ".infobox-full-data",      # 完整資料區域
+            ".tmulti",                 # 多圖片容器（如城市景觀照片）
+            ".thumb",                  # 縮略圖容器
+            ".tsingle"                 # 單圖片容器
+        ]
+        
+        image_cells = []
+        for selector in image_selectors:
+            image_cells.extend(infobox.select(selector))
+        
+        for cell in image_cells:
+            # 查找圖片元素
+            img = cell.find("img")
+            if not img:
+                continue
+                
+            # 獲取圖片URL
+            src = img.get("src") or img.get("data-src")
+            if not src:
+                continue
+            
+            # 轉換為字符串並處理URL
+            src = str(src)
+            if src.startswith("//"):
+                src = "https:" + src
+            elif src.startswith("/"):
+                src = "https://zh.wikipedia.org" + src
+            
+            # 過濾掉小圖示、編輯圖標、政黨標誌、SVG 圖片和受限制的地圖圖片
+            filter_keywords = [
+                "edit", "icon", "20px", "commons/thumb/8/8a/ooj",
+                "emblem_of_the_kuomintang",  # 國民黨圖標
+                "independent_candidate_icon", # 無黨籍圖標 
+                "disambig_gray",             # 消歧義圖標
+                "information_icon4",         # 資訊圖標
+                "40px-", "60px-",            # 小尺寸圖片
+                "chinese_characters",        # 中文字體圖片
+                "characters",                # 字體圖片
+                "phonetic",                  # 音標圖片
+                "template",                  # 模板圖片
+                "maps.wikimedia.org",        # Wikimedia 地圖瓦片 (受限制)
+                "osm-intl",                  # OpenStreetMap 地圖瓦片
+                "maplink",                   # 地圖連結圖片
+                "mapframe"                   # 地圖框架圖片
+            ]
+            
+            # 過濾掉 SVG 圖片
+            if src.lower().endswith('.svg') or '.svg/' in src.lower():
+                continue
+            
+            if any(keyword in src.lower() for keyword in filter_keywords):
+                continue
+            
+            # 過濾掉圖片尺寸太小的（寬度或高度小於80px）
+            try:
+                width = img.get("width")
+                height = img.get("height")
+                if width and str(width).replace("px", "").isdigit() and int(str(width).replace("px", "")) < 80:
+                    continue
+                if height and str(height).replace("px", "").isdigit() and int(str(height).replace("px", "")) < 80:
+                    continue
+                    
+                # 特別針對文字圖片的過濾：如果寬度大於高度的2倍（可能是文字圖片）
+                if width and height:
+                    try:
+                        w = int(str(width).replace("px", ""))
+                        h = int(str(height).replace("px", ""))
+                        if w > 0 and h > 0:
+                            ratio = w / h
+                            # 如果寬高比大於3:1，很可能是文字圖片
+                            if ratio > 3 and w < 300:  # 寬度小於300px 且寬高比大於3:1
+                                print(f"⏭ 跳過文字圖片: {src} (尺寸: {w}x{h}, 比例: {ratio:.2f})")
+                                continue
+                    except (ValueError, TypeError):
+                        pass
+            except (ValueError, AttributeError):
+                pass  # 如果無法解析尺寸，繼續處理
+                
+            # 嘗試獲取原始大小的圖片URL
+            original_src = src
+            if "/thumb/" in src and "px-" in src:
+                # 從縮略圖URL推導出原始圖片URL
+                # 例如: //upload.wikimedia.org/wikipedia/commons/thumb/5/57/20230630_Yeh_Shu-hua.jpg/250px-20230630_Yeh_Shu-hua.jpg
+                # 變成: //upload.wikimedia.org/wikipedia/commons/5/57/20230630_Yeh_Shu-hua.jpg
+                parts = src.split("/thumb/")
+                if len(parts) == 2:
+                    # 第二部分應該是 "5/57/20230630_Yeh_Shu-hua.jpg/250px-20230630_Yeh_Shu-hua.jpg"
+                    # 我們需要去掉最後的尺寸部分，只保留 "5/57/20230630_Yeh_Shu-hua.jpg"
+                    thumb_part = parts[1]
+                    # 找到最後一個 "/" 並去掉後面的尺寸版本
+                    last_slash = thumb_part.rfind("/")
+                    if last_slash != -1:
+                        file_path = thumb_part[:last_slash]  # "5/57/20230630_Yeh_Shu-hua.jpg"
+                        original_src = parts[0] + "/" + file_path
+            
+            # 獲取圖片描述
+            alt_text = img.get("alt") or "" if hasattr(img, 'get') else ""
+            title_text = img.get("title") or "" if hasattr(img, 'get') else ""
+            
+            # 轉換為字符串
+            alt_text = str(alt_text) if alt_text else ""
+            title_text = str(title_text) if title_text else ""
+            
+            # 查找圖片說明文字
+            caption = ""
+            
+            # 檢查是否在 .tmulti 容器中
+            tmulti_container = img.find_parent("div", class_="tmulti")
+            if tmulti_container:
+                # 先查找該圖片對應的 .thumbcaption
+                tsingle = img.find_parent("div", class_="tsingle")
+                if tsingle:
+                    thumbcaption = tsingle.find("div", class_="thumbcaption")
+                    if thumbcaption:
+                        caption = thumbcaption.get_text(strip=True)
+                
+                # 如果沒找到，或者只是通用文字，查找整個 tmulti 容器的總體說明
+                if not caption or caption == "圖片":
+                    # 查找 tmulti 容器底部的說明文字
+                    # 方法1: 查找 thumbinner 後面的 div
+                    thumbinner = tmulti_container.find("div", class_="thumbinner")
+                    if thumbinner:
+                        # 查找同級的說明元素
+                        for sibling in thumbinner.find_next_siblings():
+                            if hasattr(sibling, 'get_text'):
+                                sibling_text = sibling.get_text(strip=True)
+                                if sibling_text:
+                                    print(f"找到 tmulti sibling 文字: {sibling_text}")
+                                    caption = extract_specific_caption_from_tmulti(img, sibling_text, tmulti_container)
+                                    if caption:
+                                        print(f"提取到的 caption: {caption}")
+                                        break
+                    
+                    # 方法2: 如果還沒找到，在整個 tmulti 容器中查找所有文字內容
+                    if not caption or caption == "圖片":
+                        tmulti_text = tmulti_container.get_text(strip=True)
+                        print(f"tmulti 完整文字: {tmulti_text[:200]}...")
+                        if tmulti_text:
+                            caption = extract_specific_caption_from_tmulti(img, tmulti_text, tmulti_container)
+                            if caption:
+                                print(f"從完整文字提取到的 caption: {caption}")
+                                    
+                    # 方法3: 在同一個 infobox-full-data 中查找說明
+                    if not caption or caption == "圖片":
+                        infobox_data = tmulti_container.find_parent("td", class_="infobox-full-data")
+                        if infobox_data:
+                            # 查找說明文字（通常在圖片容器後）
+                            for child in infobox_data.children:
+                                if hasattr(child, 'get_text') and child != tmulti_container:
+                                    child_text = child.get_text(strip=True)
+                                    if child_text and len(child_text) > 10:  # 過濾短文字
+                                        print(f"找到 infobox-data 文字: {child_text}")
+                                        caption = extract_specific_caption_from_tmulti(img, child_text, tmulti_container)
+                                        if caption:
+                                            print(f"從 infobox-data 提取到的 caption: {caption}")
+                                            break
+            
+            # 如果不在 tmulti 容器中，或者沒找到 caption，使用原有邏輯
+            if not caption:
+                # 在整個 infobox 中查找與此圖片相關的說明文字
+                infobox = cell.find_parent("table", class_="infobox") if cell else None
+                if infobox:
+                    # 查找 infobox-caption 元素
+                    caption_elements = infobox.find_all("div", class_="infobox-caption")
+                    for cap_elem in caption_elements:
+                        # 檢查說明文字是否與此圖片在同一個單元格或相近位置
+                        caption_text = cap_elem.get_text(strip=True)
+                        if caption_text:
+                            caption = caption_text
+                            break
+                
+                # 如果沒找到，嘗試從父級元素獲取
+                if not caption:
+                    parent = img.find_parent()
+                    if parent and hasattr(parent, 'name') and parent.name in ["td", "th"]:
+                        cell_text = parent.get_text(strip=True)
+                        # 移除圖片的alt文字來獲取說明
+                        if alt_text and alt_text in cell_text:
+                            caption = cell_text.replace(alt_text, "").strip()
+                        else:
+                            caption = cell_text
+            
+            # 選擇最合適的描述文字
+            description = caption or title_text or alt_text or "圖片"
+            
+            # 清理描述文字
+            description = re.sub(r"\s+", " ", description.strip())
+            if len(description) > 100:
+                description = description[:100] + "..."
+            
+            # 下載圖片 - 使用原始大小的URL
+            filename = download_image(original_src, images_dir, session)
+            
+            if filename and description:
+                # 添加到JSONL資訊
+                image_info_json.append({
+                    "title": title,
+                    "image_url": original_src,
+                    "source_url": source_url,
+                    "image_filename": filename,
+                    "caption": description
+                })
+    
+    return image_info_text, image_info_json
+
+
+def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: Optional[Path] = None, 
+                 session: Optional[requests.Session] = None, exclude_sections: list[str] | None = None) -> Tuple[str, list[dict]]:
     """
     段落化輸出（REST / Action 皆可）：
     - 噪音先移除
+    - 抓取導航框中的圖片資訊
     - 逐掃 h2/h3/p/ul/ol；遇到被排除章節的 h2 後直到下一個 h2 全跳過
     - **H2** 上下各留 1 空白行；其餘行單換行
     - 若偵測到「<標籤>：」後內容缺失，從該段 DOM 裡補抓值
     - 最後呼叫 zh_tidy 做標點與空白收斂
+    返回: (處理後的文本, 圖片資訊JSONL列表)
     """
     soup = BeautifulSoup(html, "html.parser")
+
+    # 在移除導航框之前，先提取圖片資訊
+    nav_images_text, nav_images_json = [], []
+    if images_dir and session:
+        nav_images_text, nav_images_json = extract_images_from_infoboxes(
+            soup, title, source_url, images_dir, session)
 
     # 噪音清除
     for tag in soup.select("style, script, noscript"):
@@ -886,7 +1315,7 @@ def html_to_text(html: str, exclude_sections: list[str] | None = None) -> str:
     text = remove_archive_links(text)
     
     text = zh_tidy(text)
-    return text
+    return text, nav_images_json
 
 
 def separate_concatenated_titles(text: str) -> str:
@@ -939,9 +1368,11 @@ def remove_archive_links(text: str) -> str:
 # 主流程：單篇處理
 # -------------------------------
 def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
-                exclude_sections: list[str], jsonl_file) -> Tuple[str, bool, str]:
+                exclude_sections: list[str], jsonl_file, source_file: str = "") -> Tuple[str, bool, str]:
     title = url_to_title(raw) if kind == "url" else raw
     txt_dir = out_dir / "txt"
+    images_dir = out_dir / "images"
+    images_jsonl = out_dir / "images" / "images_info.jsonl"
 
     requested_filename = safe_filename(title)
     requested_path = txt_dir / f"{requested_filename}.txt"
@@ -951,16 +1382,22 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
     # 先 Action（variant=zh-tw），失敗再 REST（帶 Accept-Language: zh-tw）
     html = None
     actual_title = title
+    source_url = f"https://zh.wikipedia.org/wiki/{quote(title, safe='')}"
+    
     try:
         html, actual_title = fetch_html_action(title, session)
     except Exception:
         html, actual_title = fetch_html_rest(title, session)
 
-    text = html_to_text(html, exclude_sections=exclude_sections)
+    text, image_info = html_to_text(html, title=actual_title, source_url=source_url, 
+                                   images_dir=images_dir, session=session, 
+                                   exclude_sections=exclude_sections)
 
     redirect_target = detect_redirect(text)
     if redirect_target and redirect_target != title:
         print(f"🔄 檢測到重定向：{title} -> {redirect_target}")
+        source_url = f"https://zh.wikipedia.org/wiki/{quote(redirect_target, safe='')}"
+        
         try:
             html, actual_title = fetch_html_action(redirect_target, session)
         except Exception:
@@ -969,7 +1406,9 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
             except Exception as e:
                 raise RuntimeError(f"重定向目標頁面抓取失敗: {redirect_target}, 錯誤: {e}")
 
-        text = html_to_text(html, exclude_sections=exclude_sections)
+        text, image_info = html_to_text(html, title=actual_title, source_url=source_url,
+                                       images_dir=images_dir, session=session,
+                                       exclude_sections=exclude_sections)
 
     # 全文兜底：若仍有「<語言標籤>：<缺值>」，用 langlinks 補
     text = ensure_labels_after_marker(text, title=actual_title, session=session)
@@ -986,6 +1425,13 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
     out_txt.parent.mkdir(parents=True, exist_ok=True)
     out_txt.write_text(text, encoding="utf-8")
 
+    # 保存圖片資訊到JSONL文件
+    if image_info:
+        images_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        with images_jsonl.open("a", encoding="utf-8") as img_file:
+            for img_data in image_info:
+                img_file.write(json.dumps(img_data, ensure_ascii=False) + "\n")
+
     rec = {
         "title": actual_title,
         "original_query": title,
@@ -995,10 +1441,17 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
         "text_length": len(text),
         "text": text,
         "out_file": str(Path("txt") / f"{final_filename}.txt"),
+        "source_file": source_file,  # 新增來源檔案資訊
     }
     if redirect_target:
         rec["redirected_from"] = title
         rec["redirected_to"] = actual_title
+    
+    # 添加圖片資訊到記錄中
+    if image_info:
+        rec["images_count"] = len(image_info)
+        rec["images"] = [{"filename": img["image_filename"], "caption": img["caption"]} 
+                        for img in image_info]
 
     if jsonl_file is not None:
         jsonl_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -1012,19 +1465,23 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
 # -------------------------------
 def main():
     ap = argparse.ArgumentParser(description="批次抓取中文維基（臺灣正體 zh-TW）")
-    ap.add_argument("--targets", required=True, help="目標清單路徑：.txt 或 .jsonl")
+    ap.add_argument("--targets", required=True, help="目標清單路徑：.txt 或 .jsonl 檔案，或包含多個 .txt/.jsonl 檔案的資料夾路徑")
     ap.add_argument("--out-dir", default="out", help="輸出資料夾")
-    ap.add_argument("--sleep", type=float, default=1.0, help="每篇之間的延遲秒數（禮貌抓取）")
+    ap.add_argument("--sleep", type=float, default=0.5, help="每篇之間的延遲秒數（禮貌抓取）")
     ap.add_argument("--ua", default=DEFAULT_UA, help="自訂 User-Agent（請填可聯絡資訊）")
     ap.add_argument(
         "--exclude-sections",
         # zh 變體會把「相关条目/扩展阅读」自動轉為「相關條目/擴展閱讀」
-        default="參考書目,相關學術研究書目,參考來源,參考資料,外部連結,相關條目,擴展閱讀,延伸閱讀,參見,參考文獻,腳註,註釋,註解,注解,備註,關聯項目,資料來源,注釋,註腳,注腳,關連項目",
+        default="參考書目,相關學術研究書目,參考,參考來源,參考資料,外部連結,相關條目,擴展閱讀,延伸閱讀,參見,參考文獻,腳註,註釋,註解,注解,備註,關聯項目,資料來源,注釋,註腳,注腳,關連項目,備注,備註",
         help="要排除的章節標題（以逗號分隔）",
     )
     args = ap.parse_args()
 
     targets_path = Path(args.targets)
+    if not targets_path.exists():
+        print(f"❌ 目標路徑不存在: {targets_path}")
+        return
+        
     out_dir = Path(args.out_dir)
     exclude_sections = [s.strip() for s in args.exclude_sections.split(",") if s.strip()]
 
@@ -1036,41 +1493,62 @@ def main():
     })
 
     ok, skip, fail = 0, 0, 0
+    current_source_file = ""
     failures_log = out_dir / "_failures.jsonl"
     txt_dir = out_dir / "txt"
     json_dir = out_dir / "jsonl"
+    images_dir = out_dir / "images"
     all_data_jsonl = json_dir / "all_data.jsonl"
+    images_jsonl = images_dir / "images_info.jsonl"
 
     out_dir.mkdir(parents=True, exist_ok=True)
     json_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 先計算總數量，以便顯示進度
+    all_targets = list(iter_targets(targets_path))
+    total_count = len(all_targets)
+    processed_count = 0
+    
+    print(f"🚀 開始處理 {total_count} 個目標")
+    
     with all_data_jsonl.open("a", encoding="utf-8") as jsonl_file:
-        for raw, kind in iter_targets(targets_path):
+        for raw, kind, source_file in all_targets:
+            processed_count += 1
+            
+            # 顯示當前處理的檔案（如果變更）
+            if source_file != current_source_file:
+                current_source_file = source_file
+                print(f"\n📂 當前處理檔案: {Path(source_file).name}")
+            
             try:
-                title, success, msg = process_one(raw, kind, out_dir, S, exclude_sections, jsonl_file)
+                title, success, msg = process_one(raw, kind, out_dir, S, exclude_sections, jsonl_file, source_file)
                 if msg == "exists":
                     skip += 1
-                    print(f"⏭️  略過（已存在）：{title}")
+                    print(f"⏭️  [{processed_count}/{total_count}] 略過（已存在）：{title}")
                 elif msg == "redirect_exists":
                     skip += 1
-                    print(f"⏭️  略過（重定向目標已存在）：{title}")
+                    print(f"⏭️  [{processed_count}/{total_count}] 略過（重定向目標已存在）：{title}")
                 elif msg == "redirect_ok":
                     ok += 1
-                    print(f"✅ 完成（重定向）：{raw} -> {title}")
+                    print(f"✅ [{processed_count}/{total_count}] 完成（重定向）：{raw} -> {title}")
                 else:
                     ok += 1
-                    print(f"✅ 完成：{title}")
+                    print(f"✅ [{processed_count}/{total_count}] 完成：{title}")
             except Exception as e:
                 fail += 1
-                print(f"❌  失敗：{raw}  -> {e}")
+                print(f"❌  [{processed_count}/{total_count}] 失敗：{raw}  -> {e}")
                 failures_log.parent.mkdir(parents=True, exist_ok=True)
                 with failures_log.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"raw": raw, "kind": kind, "error": str(e)}, ensure_ascii=False) + "\n")
+                    f.write(json.dumps({"raw": raw, "kind": kind, "source_file": source_file, "error": str(e)}, ensure_ascii=False) + "\n")
             time.sleep(args.sleep)
 
     print("\n=== 統計 ===")
     print(f"成功：{ok}  已存在：{skip}  失敗：{fail}")
     print(f"文字輸出：{txt_dir.resolve()}")
     print(f"JSONL 輸出：{all_data_jsonl.resolve()}")
+    if images_jsonl.exists():
+        print(f"圖片資訊：{images_jsonl.resolve()}")
+        print(f"圖片下載：{images_dir.resolve()}")
 
 
 if __name__ == "__main__":
