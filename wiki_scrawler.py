@@ -181,6 +181,39 @@ def detect_redirect(text: str) -> Optional[str]:
     return None
 
 
+def detect_redirect_from_html(html: str) -> Optional[str]:
+    """
+    從HTML結構檢測重定向，特別是處理REST API返回的重定向頁面
+    """
+    from bs4 import BeautifulSoup
+    from urllib.parse import unquote
+    
+    # 檢查是否為特殊重定向頁面
+    if 'Special:Redirect' in html:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # 檢查 rel="dc:isVersionOf" 連結
+        version_link = soup.find('link', rel='dc:isVersionOf')
+        if version_link and version_link.get('href'):
+            href = version_link['href']
+            # 提取頁面標題 (移除 //zh.wikipedia.org/wiki/ 前綴)
+            if '/wiki/' in href:
+                encoded_title = href.split('/wiki/')[-1]
+                title = unquote(encoded_title)
+                return title
+        
+        # 檢查頁面標題
+        title_tag = soup.find('title')
+        if title_tag:
+            title_text = title_tag.get_text().strip()
+            # 移除 " - 维基百科" 等後綴
+            title_text = re.sub(r'\s*[-–]\s*[^-–]*维基百科[^-–]*$', '', title_text)
+            if title_text and title_text != '重定向':
+                return title_text
+    
+    return None
+
+
 def fetch_html_action(title: str, session: requests.Session, timeout=30) -> Tuple[str, str]:
     """
     抓取頁面內容，同時返回實際的標題（處理重定向）
@@ -1197,7 +1230,8 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
             # 移除摺疊的樣式，讓內容完全展開
             collapsible["class"] = [c for c in collapsible.get("class", []) if c not in ["mw-collapsed", "mw-collapsible"]]
 
-    root = soup.select_one("div.mw-parser-output") or soup.body or soup
+    # 選擇正確的mw-parser-output（在mw-content-text裡面的主要內容，而不是坐標指示器裡的）
+    root = soup.select_one("#mw-content-text .mw-parser-output") or soup.select_one("div.mw-parser-output") or soup.body or soup
     elements = root.find_all(["h2", "h3", "p", "ul", "ol", "dl", "table"], recursive=True)
 
     exclude = set(exclude_sections or [])
@@ -1210,6 +1244,25 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
     def squeeze(s: str) -> str:
         return re.sub(r"[ \t\u00A0]+", " ", s.strip())
 
+    # 追蹤已處理的標題，避免重複
+    processed_titles = set()
+    
+    def add_title_if_new(title_text, prefix=""):
+        """只在標題沒有重複時才添加"""
+        if not title_text:
+            return False
+        
+        # 標準化標題用於比較（移除前綴和空白）
+        normalized = title_text.replace("###", "").replace("##", "").strip()
+        if normalized in processed_titles:
+            return False
+        
+        processed_titles.add(normalized)
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append(f"{prefix}{title_text}")
+        return True
+
     for el in elements:
         if el.name == "h2":
             title = norm_title(smart_text(el))
@@ -1217,10 +1270,7 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
                 skipping = True
                 continue
             skipping = False
-            if lines and lines[-1] != "":
-                lines.append("")          # H2 前空行
-            if title:
-                lines.append(squeeze(title))
+            if add_title_if_new(title, "## "):
                 lines.append("")          # H2 後空行
             continue
 
@@ -1231,11 +1281,7 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
             if el.find_parent("table", class_="multicol"):
                 continue
             title = norm_title(smart_text(el))
-            if title:
-                # 確保H3前有適當的分隔（如果前面不是空行的話）
-                if lines and lines[-1] != "":
-                    lines.append("")
-                lines.append(squeeze(title))
+            add_title_if_new(title, "### ")
             continue
 
         if skipping:
@@ -1308,6 +1354,9 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
 
     text = "\n".join(lines)
     
+    # 後處理：移除連續重複的標題
+    text = remove_duplicate_headings(text)
+    
     # 後處理：分離可能連在一起的標題
     text = separate_concatenated_titles(text)
     
@@ -1316,6 +1365,40 @@ def html_to_text(html: str, title: str = "", source_url: str = "", images_dir: O
     
     text = zh_tidy(text)
     return text, nav_images_json
+
+
+def remove_duplicate_headings(text: str) -> str:
+    """
+    移除連續重複的標題，例如：
+    ### 吉他
+    ### 吉他
+    ### 吉他
+    -> 只保留一個 ### 吉他
+    """
+    lines = text.split('\n')
+    result_lines = []
+    last_heading = None
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        # 檢查是否為標題行（## 或 ### 開頭）
+        if stripped.startswith('###') or stripped.startswith('##'):
+            # 標準化標題進行比較（移除前綴和多餘空白）
+            normalized = stripped.replace('###', '').replace('##', '').strip()
+            
+            # 如果與上一個標題不同，或者不是標題，則添加
+            if normalized != last_heading:
+                result_lines.append(line)
+                last_heading = normalized
+            # 如果是重複標題，跳過
+        else:
+            # 非標題行，直接添加，並重置標題追蹤
+            result_lines.append(line)
+            if stripped:  # 非空行才重置
+                last_heading = None
+    
+    return '\n'.join(result_lines)
 
 
 def separate_concatenated_titles(text: str) -> str:
@@ -1388,6 +1471,20 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
         html, actual_title = fetch_html_action(title, session)
     except Exception:
         html, actual_title = fetch_html_rest(title, session)
+
+    # 檢查HTML層面的重定向（特別是REST API返回的重定向頁面）
+    html_redirect_target = detect_redirect_from_html(html)
+    if html_redirect_target and html_redirect_target != title:
+        print(f"🔄 檢測到HTML重定向：{title} -> {html_redirect_target}")
+        source_url = f"https://zh.wikipedia.org/wiki/{quote(html_redirect_target, safe='')}"
+        
+        try:
+            html, actual_title = fetch_html_action(html_redirect_target, session)
+        except Exception:
+            try:
+                html, actual_title = fetch_html_rest(html_redirect_target, session)
+            except Exception as e:
+                raise RuntimeError(f"重定向目標頁面抓取失敗: {html_redirect_target}, 錯誤: {e}")
 
     text, image_info = html_to_text(html, title=actual_title, source_url=source_url, 
                                    images_dir=images_dir, session=session, 
@@ -1472,7 +1569,7 @@ def main():
     ap.add_argument(
         "--exclude-sections",
         # zh 變體會把「相关条目/扩展阅读」自動轉為「相關條目/擴展閱讀」
-        default="參考書目,相關學術研究書目,參考,參考來源,參考資料,外部連結,相關條目,擴展閱讀,延伸閱讀,參見,參考文獻,腳註,註釋,註解,注解,備註,關聯項目,資料來源,注釋,註腳,注腳,關連項目,備注,備註",
+        default="引用資料,參考書目,相關學術研究書目,參考,參考來源,參考資料,外部連結,相關條目,擴展閱讀,延伸閱讀,參見,參考文獻,腳註,註釋,註解,注解,備註,關聯項目,資料來源,注釋,註腳,注腳,關連項目,備注,備註",
         help="要排除的章節標題（以逗號分隔）",
     )
     args = ap.parse_args()
