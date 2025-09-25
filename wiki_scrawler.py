@@ -1451,7 +1451,7 @@ def remove_archive_links(text: str) -> str:
 # 主流程：單篇處理
 # -------------------------------
 def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
-                exclude_sections: list[str], jsonl_file, source_file: str = "") -> Tuple[str, bool, str]:
+                exclude_sections: list[str], jsonl_file, source_file: str = "", force: bool = False) -> Tuple[str, bool, str]:
     title = url_to_title(raw) if kind == "url" else raw
     txt_dir = out_dir / "txt"
     images_dir = out_dir / "images"
@@ -1459,7 +1459,8 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
 
     requested_filename = safe_filename(title)
     requested_path = txt_dir / f"{requested_filename}.txt"
-    if requested_path.exists():
+    # 如果 force=True，無論文件是否存在都要處理；如果 force=False 且文件存在，則跳過
+    if not force and requested_path.exists():
         return title, True, "exists"
 
     # 先 Action（variant=zh-tw），失敗再 REST（帶 Accept-Language: zh-tw）
@@ -1510,11 +1511,16 @@ def process_one(raw: str, kind: str, out_dir: Path, session: requests.Session,
     # 全文兜底：若仍有「<語言標籤>：<缺值>」，用 langlinks 補
     text = ensure_labels_after_marker(text, title=actual_title, session=session)
 
+    # 檢查文本長度，如果為 0 則拋出錯誤
+    if len(text.strip()) == 0:
+        raise RuntimeError(f"抓取的文本長度為 0：{actual_title}")
+
     final_filename = safe_filename(actual_title)
     out_txt = txt_dir / f"{final_filename}.txt"
     status = "redirect_ok" if redirect_target else "ok"
 
-    if out_txt.exists():
+    # 如果 force=True，無論文件是否存在都要覆蓋；如果 force=False 且文件存在，則跳過
+    if not force and out_txt.exists():
         if redirect_target:
             return actual_title, True, "redirect_exists"
         return actual_title, True, "exists"
@@ -1566,6 +1572,7 @@ def main():
     ap.add_argument("--out-dir", default="out", help="輸出資料夾")
     ap.add_argument("--sleep", type=float, default=0.5, help="每篇之間的延遲秒數（禮貌抓取）")
     ap.add_argument("--ua", default=DEFAULT_UA, help="自訂 User-Agent（請填可聯絡資訊）")
+    ap.add_argument("--force", action="store_true", help="強制重新下載已存在的檔案")
     ap.add_argument(
         "--exclude-sections",
         # zh 變體會把「相关条目/扩展阅读」自動轉為「相關條目/擴展閱讀」
@@ -1608,36 +1615,71 @@ def main():
     
     print(f"🚀 開始處理 {total_count} 個目標")
     
-    with all_data_jsonl.open("a", encoding="utf-8") as jsonl_file:
-        for raw, kind, source_file in all_targets:
-            processed_count += 1
+    import io
+    for raw, kind, source_file in all_targets:
+        processed_count += 1
+        
+        # 顯示當前處理的檔案（如果變更）
+        if source_file != current_source_file:
+            current_source_file = source_file
+            print(f"\n📂 當前處理檔案: {Path(source_file).name}")
+        
+        try:
+            # 使用 StringIO 暫存 jsonl 記錄
+            rec_io = io.StringIO()
+            title, success, msg = process_one(raw, kind, out_dir, S, exclude_sections, rec_io, source_file, args.force)
             
-            # 顯示當前處理的檔案（如果變更）
-            if source_file != current_source_file:
-                current_source_file = source_file
-                print(f"\n📂 當前處理檔案: {Path(source_file).name}")
+            # 解析新產生的記錄
+            rec_io.seek(0)
+            new_rec = None
+            for line in rec_io:
+                if line.strip():
+                    new_rec = json.loads(line)
+                    break
             
-            try:
-                title, success, msg = process_one(raw, kind, out_dir, S, exclude_sections, jsonl_file, source_file)
-                if msg == "exists":
-                    skip += 1
-                    print(f"⏭️  [{processed_count}/{total_count}] 略過（已存在）：{title}")
-                elif msg == "redirect_exists":
-                    skip += 1
-                    print(f"⏭️  [{processed_count}/{total_count}] 略過（重定向目標已存在）：{title}")
-                elif msg == "redirect_ok":
-                    ok += 1
-                    print(f"✅ [{processed_count}/{total_count}] 完成（重定向）：{raw} -> {title}")
+            # 只有成功處理且有新記錄時才寫入 jsonl
+            if new_rec and success and msg not in ["exists", "redirect_exists"]:
+                if args.force:
+                    # force 模式：讀取現有 jsonl，移除同 title 的舊記錄，再寫回全部
+                    all_jsonl = []
+                    if all_data_jsonl.exists():
+                        with all_data_jsonl.open("r", encoding="utf-8") as f:
+                            for line in f:
+                                if line.strip():
+                                    try:
+                                        obj = json.loads(line)
+                                        if obj.get("title") != title:
+                                            all_jsonl.append(obj)
+                                    except Exception:
+                                        pass
+                    all_jsonl.append(new_rec)
+                    with all_data_jsonl.open("w", encoding="utf-8") as f:
+                        for obj in all_jsonl:
+                            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
                 else:
-                    ok += 1
-                    print(f"✅ [{processed_count}/{total_count}] 完成：{title}")
-            except Exception as e:
-                fail += 1
-                print(f"❌  [{processed_count}/{total_count}] 失敗：{raw}  -> {e}")
-                failures_log.parent.mkdir(parents=True, exist_ok=True)
-                with failures_log.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"raw": raw, "kind": kind, "source_file": source_file, "error": str(e)}, ensure_ascii=False) + "\n")
-            time.sleep(args.sleep)
+                    # 非 force 模式：直接追加
+                    with all_data_jsonl.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(new_rec, ensure_ascii=False) + "\n")
+            
+            if msg == "exists":
+                skip += 1
+                print(f"⏭️  [{processed_count}/{total_count}] 略過（已存在）：{title}")
+            elif msg == "redirect_exists":
+                skip += 1
+                print(f"⏭️  [{processed_count}/{total_count}] 略過（重定向目標已存在）：{title}")
+            elif msg == "redirect_ok":
+                ok += 1
+                print(f"✅ [{processed_count}/{total_count}] 完成（重定向）：{raw} -> {title}")
+            else:
+                ok += 1
+                print(f"✅ [{processed_count}/{total_count}] 完成：{title}")
+        except Exception as e:
+            fail += 1
+            print(f"❌  [{processed_count}/{total_count}] 失敗：{raw}  -> {e}")
+            failures_log.parent.mkdir(parents=True, exist_ok=True)
+            with failures_log.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"raw": raw, "kind": kind, "source_file": source_file, "error": str(e)}, ensure_ascii=False) + "\n")
+        time.sleep(args.sleep)
 
     print("\n=== 統計 ===")
     print(f"成功：{ok}  已存在：{skip}  失敗：{fail}")
